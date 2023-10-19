@@ -4,7 +4,8 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "concurrently \"vite\" \"cargo shuttle run --working-directory api\"",
+    "api": "cargo watch --workdir api -qcx \"shuttle run\"",
+    "dev": "concurrently \"vite\" \"npm run api\"",
     "build": "tsc && vite build --emptyOutDir",
     "deploy": "npm run build && cargo shuttle deploy --allow-dirty --working-directory api",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",

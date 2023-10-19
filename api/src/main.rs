@@ -1,100 +1,110 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+mod game;
+use game::{play_game, Player};
+
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        WebSocketUpgrade,
+        Path, WebSocketUpgrade,
     },
     response::IntoResponse,
     routing::get,
     Extension, Router,
 };
 use futures::{SinkExt, StreamExt};
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use serde::{Deserialize, Serialize};
-use shuttle_secrets::SecretStore;
-use tokio::sync::{
-    mpsc::{self, UnboundedSender},
-    RwLock,
-};
+use tokio::sync::RwLock;
 use tower_http::services::ServeDir;
 
-type Users = Arc<RwLock<HashMap<usize, UnboundedSender<Message>>>>;
-static NEXT_USERID: AtomicUsize = AtomicUsize::new(1);
+type Games = Arc<RwLock<HashMap<String, Player>>>;
 
 #[derive(Serialize, Deserialize)]
-struct Msg {
-    message: String,
-    uid: Option<usize>,
+enum GameConnectionMessage {
+    Game(String),
+    NoSuchGame,
+    JoinedGame,
 }
 
 #[shuttle_runtime::main]
-async fn main(#[shuttle_secrets::Secrets] secrets: SecretStore) -> shuttle_axum::ShuttleAxum {
-    let secret = secrets.get("BEARER").unwrap_or("Bear".to_string());
-    let router = router(secret).nest_service("/", ServeDir::new("static"));
+async fn main() -> shuttle_axum::ShuttleAxum {
+    let games = Games::default();
+
+    let router = Router::new()
+        .route("/game", get(new_game))
+        .route("/game/:game_id", get(join_game))
+        .layer(Extension(games))
+        .nest_service("/", ServeDir::new("static"));
 
     Ok(router.into())
 }
 
-fn router(secret: String) -> Router {
-    let users = Users::default();
-
-    Router::new()
-        .route("/ws", get(ws_handler))
-        .layer(Extension(users))
+async fn new_game(ws: WebSocketUpgrade, Extension(games): Extension<Games>) -> impl IntoResponse {
+    ws.on_upgrade(|socket| new_game_callback(socket, games))
 }
 
-async fn ws_handler(ws: WebSocketUpgrade, Extension(state): Extension<Users>) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+async fn new_game_callback(socket: WebSocket, games: Games) {
+    let id = {
+        let (mut sender, reciever) = socket.split();
+
+        let mut games = games.write().await;
+        let mut id: String;
+        {
+            let mut rng = thread_rng();
+            loop {
+                // TODO: Is this random enough?
+                id = (0..20).map(|_| rng.sample(Alphanumeric) as char).collect();
+                if !games.contains_key(&id) {
+                    break;
+                }
+            }
+        }
+    
+        sender
+            .send(Message::Text(
+                serde_json::to_string(&GameConnectionMessage::Game(id.clone())).unwrap(),
+            ))
+            .await
+            .expect("Couldn't send message");
+        games.insert(id.clone(), Player { sender, reciever });
+        id
+    };
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(5 * 60)).await;
+
+    // NOTE: ID could be reused, but unlikely.
+    games.write().await.remove(&id);
 }
 
-async fn handle_socket(stream: WebSocket, state: Users) {
-    let my_id = NEXT_USERID.fetch_add(1, Ordering::Relaxed);
-    let (mut sender, mut reciever) = stream.split();
-    sender
-        .send(Message::Text("\"Hello world!\"".into()))
-        .await
-        .unwrap();
-
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    state.write().await.insert(my_id, tx);
-
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            sender.send(msg).await.expect("Error while sending message")
-        }
-        sender.close().await.unwrap();
-    });
-
-    while let Some(Ok(result)) = reciever.next().await {
-        if let Ok(result) = enrich_result(result, my_id) {
-            broadcast_msg(result, &state).await;
-        }
-    }
+async fn join_game(
+    ws: WebSocketUpgrade,
+    Extension(games): Extension<Games>,
+    Path(game_id): Path<String>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| join_game_callback(socket, games, game_id))
 }
 
-async fn broadcast_msg(msg: Message, users: &Users) {
-    if let Message::Text(msg) = msg {
-        for (&_uid, tx) in users.read().await.iter() {
-            tx.send(Message::Text(msg.clone()))
-                .expect("Failed to send message.");
-        }
-    }
-}
+async fn join_game_callback(socket: WebSocket, games: Games, game_id: String) {
+    let (mut sender, reciever) = socket.split();
 
-fn enrich_result(result: Message, id: usize) -> Result<Message, serde_json::Error> {
-    match result {
-        Message::Text(msg) => {
-            let mut msg: Msg = serde_json::from_str(&msg)?;
-            msg.uid = Some(id);
-            let msg = serde_json::to_string(&msg)?;
-            Ok(Message::Text(msg))
-        }
-        _ => Ok(result),
-    }
+    let player = if let Some(player) = games.write().await.remove(&game_id) {
+        sender
+            .send(Message::Text(
+                serde_json::to_string(&GameConnectionMessage::JoinedGame).unwrap(),
+            ))
+            .await
+            .expect("Couldn't send message");
+        player
+    } else {
+        sender
+            .send(Message::Text(
+                serde_json::to_string(&GameConnectionMessage::NoSuchGame).unwrap(),
+            ))
+            .await
+            .expect("Couldn't send message");
+        return;
+    };
+
+    play_game([player, Player { sender, reciever }]).await;
 }
